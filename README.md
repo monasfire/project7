@@ -48,7 +48,7 @@ Detailed examples (no position, only Up, only Down, have both, Flat, market clos
 
 ```bash
 git clone https://github.com/cakaroni/polymarket-trading-bot-btc-15m.git
-cd polymarket-trading-bot
+cd polymarket-trading-bot-btc-15m
 cargo build --release
 ```
 

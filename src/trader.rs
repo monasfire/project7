@@ -1,67 +1,48 @@
-//! Trend-based strategy:
-//! - Monitor price over short window (4–5 data points). If one side is rising → buy that side (2–3 times). If flat → buy higher side once.
-//! - When we can lock PnL (cost per pair ≤ max) by buying the other side → buy it (lock).
-//! - After lock, monitor again: if the other side is falling or flat → buy our side again; repeat.
-//! PnL is calculated only after market closes (same in simulation and production).
+//! Human-interactive trading:
+//! - Price feed is shown in terminal; human decides when to act.
+//! - + = place Up batch (limit buy at ask+0.01), - = place Down batch, * = cancel Up orders, / = cancel Down orders.
+//! - Matched: in sim when market price passes limit; in prod verified via fills API. Display positions and PnL.
 
 use crate::api::PolymarketApi;
 use crate::monitor::MarketSnapshot;
 use anyhow::Result;
 use log::warn;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-const PRICE_HISTORY_LEN: usize = 5;
-const TREND_THRESHOLD: f64 = 0.005;
-const MAX_RISING_BUYS_PER_WAVE: u32 = 3;
-/// When no position and trend is rising: buy the rising side at most 1–2 times.
-const MAX_RISING_BUYS_NO_POSITION: u32 = 2;
-/// When no position and trend is flat: buy the higher-priced side up to 3–4 times.
-const MAX_FLAT_BUYS_NO_POSITION: u32 = 4;
-/// When rebalancing PnL (buying the side with worse outcome), allow cost per pair up to this.
-const REBALANCE_COST_PER_PAIR_MAX: f64 = 1.02;
-/// Max buys of one side when rebalancing PnL (outcome skewed); can be higher than trend-follow limit.
-const MAX_REBALANCE_BUYS: u32 = 8;
+const MATCH_EPSILON: f64 = 0.0001;
 
-#[derive(Debug, Clone, Default)]
-struct WaveState {
-    buys_up_since_lock: u32,
-    buys_down_since_lock: u32,
-    /// When no position and flat, how many "buy higher side" we did (max MAX_FLAT_BUYS_NO_POSITION).
-    flat_buys_since_lock: u32,
+#[derive(Debug, Clone)]
+struct PendingOrder {
+    side: String,
+    price: f64,
+    size: f64,
+    order_id: Option<String>,
+    matched: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Trend {
-    UpRising,
-    DownRising,
-    Flat,
-    /// Down price falling (up_ask rising)
-    DownFalling,
-    /// Up price falling (down_ask rising)
-    UpFalling,
+#[derive(Debug, Clone)]
+struct PendingBatch {
+    placed_at: u64,
+    orders: Vec<PendingOrder>,
 }
 
 pub struct Trader {
     api: Arc<PolymarketApi>,
     simulation_mode: bool,
-    cost_per_pair_max: f64,
+    batch_count: usize,
+    shares_per_limit_order: f64,
     min_side_price: f64,
     max_side_price: f64,
-    cooldown_seconds: u64,
-    cooldown_seconds_1h: u64,
-    shares_override: Option<f64>,
-    size_reduce_after_secs: u64,
-    size_min_ratio: f64,
-    size_min_shares: f64,
-    last_buy: Arc<Mutex<HashMap<String, (u64, u64)>>>,
+    /// market_key -> batches of placed orders (Up and/or Down)
+    pending_batches: Arc<Mutex<HashMap<String, std::collections::VecDeque<PendingBatch>>>>,
+    last_pnl_log: Arc<Mutex<HashMap<String, (f64, f64, usize, f64)>>>,
+    last_fill_sync: Arc<Mutex<HashMap<String, u64>>>,
     trades: Arc<Mutex<HashMap<String, CycleTrade>>>,
     total_profit: Arc<Mutex<f64>>,
     period_profit: Arc<Mutex<f64>>,
     closure_checked: Arc<Mutex<HashMap<String, bool>>>,
-    price_history: Arc<Mutex<HashMap<String, VecDeque<(u64, f64, f64)>>>>,
-    wave_state: Arc<Mutex<HashMap<String, WaveState>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -81,113 +62,29 @@ impl Trader {
     pub fn new(
         api: Arc<PolymarketApi>,
         simulation_mode: bool,
-        cost_per_pair_max: f64,
+        batch_count: usize,
+        shares_per_limit_order: f64,
         min_side_price: f64,
         max_side_price: f64,
-        cooldown_seconds: u64,
-        cooldown_seconds_1h: u64,
-        shares_override: Option<f64>,
-        size_reduce_after_secs: u64,
-        size_min_ratio: f64,
-        size_min_shares: f64,
     ) -> Self {
         Self {
             api,
             simulation_mode,
-            cost_per_pair_max,
+            batch_count,
+            shares_per_limit_order,
             min_side_price,
             max_side_price,
-            cooldown_seconds,
-            cooldown_seconds_1h,
-            shares_override,
-            size_reduce_after_secs,
-            size_min_ratio,
-            size_min_shares,
-            last_buy: Arc::new(Mutex::new(HashMap::new())),
+            pending_batches: Arc::new(Mutex::new(HashMap::new())),
+            last_pnl_log: Arc::new(Mutex::new(HashMap::new())),
+            last_fill_sync: Arc::new(Mutex::new(HashMap::new())),
             trades: Arc::new(Mutex::new(HashMap::new())),
             total_profit: Arc::new(Mutex::new(0.0)),
             period_profit: Arc::new(Mutex::new(0.0)),
             closure_checked: Arc::new(Mutex::new(HashMap::new())),
-            price_history: Arc::new(Mutex::new(HashMap::new())),
-            wave_state: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// Update price history and return current trend (need at least 4 points).
-    async fn update_trend(
-        &self,
-        market_key: &str,
-        current_time: u64,
-        up_ask: f64,
-        down_ask: f64,
-    ) -> Trend {
-        let mut hist = self.price_history.lock().await;
-        let entry = hist.entry(market_key.to_string()).or_default();
-        entry.push_back((current_time, up_ask, down_ask));
-        while entry.len() > PRICE_HISTORY_LEN {
-            entry.pop_front();
-        }
-        let len = entry.len();
-        let first = entry.front().copied().unwrap_or((0, 0.0, 0.0));
-        let last = entry.back().copied().unwrap_or((0, 0.0, 0.0));
-        drop(hist);
-
-        if len < 4 {
-            return Trend::Flat;
-        }
-        let up_delta = last.1 - first.1;
-        let down_delta = last.2 - first.2;
-        if up_delta >= TREND_THRESHOLD && up_delta >= down_delta {
-            Trend::UpRising
-        } else if down_delta >= TREND_THRESHOLD && down_delta >= up_delta {
-            Trend::DownRising
-        } else if down_delta <= -TREND_THRESHOLD && down_delta <= up_delta {
-            Trend::DownFalling
-        } else if up_delta <= -TREND_THRESHOLD && up_delta <= down_delta {
-            Trend::UpFalling
-        } else {
-            Trend::Flat
-        }
-    }
-
-    /// Base size per market (no time reduction).
-    fn base_shares_for_market(&self, market_name: &str) -> f64 {
-        if let Some(s) = self.shares_override {
-            if s > 0.0 {
-                return s;
-            }
-        }
-        let upper = market_name.to_uppercase();
-        if upper.starts_with("BTC") && upper.contains("15") {
-            24.0
-        } else if upper.starts_with("ETH") && upper.contains("15") {
-            14.0
-        } else if upper.starts_with("BTC") && (upper.contains("1H") || upper.contains("1 H")) {
-            26.0
-        } else if upper.starts_with("ETH") && (upper.contains("1H") || upper.contains("1 H")) {
-            16.0
-        } else {
-            24.0
-        }
-    }
-
-    /// Size to use for this snapshot: reduce toward market end (volatility). Target does this.
-    fn shares_for_market_with_time(
-        &self,
-        market_name: &str,
-        time_remaining_secs: u64,
-        _market_duration_secs: u64,
-    ) -> f64 {
-        let base = self.base_shares_for_market(market_name);
-        if self.size_reduce_after_secs == 0 || time_remaining_secs >= self.size_reduce_after_secs {
-            return base;
-        }
-        let ratio = self.size_min_ratio
-            + (1.0 - self.size_min_ratio) * (time_remaining_secs as f64 / self.size_reduce_after_secs as f64);
-        let size = (base * ratio * 100.0).round() / 100.0;
-        size.max(self.size_min_shares)
-    }
-
+    /// Process each snapshot: update matched from price (sim) or rely on fill sync (prod), then log position/PnL when changed.
     pub async fn process_snapshot(&self, snapshot: &MarketSnapshot) -> Result<()> {
         let market_name = &snapshot.market_name;
         let market_data = &snapshot.btc_market_15m;
@@ -214,372 +111,427 @@ impl Trader {
             return Ok(());
         }
 
+        let market_key = format!("{}:{}", condition_id, period_timestamp);
         let current_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
 
-        let market_key = format!("{}:{}", condition_id, period_timestamp);
-        let (up_shares, down_shares, up_avg, down_avg) = {
-            let t = self.trades.lock().await;
-            t.get(&market_key)
-                .map(|e| (e.up_shares, e.down_shares, e.up_avg_price, e.down_avg_price))
-                .unwrap_or((0.0, 0.0, 0.0, 0.0))
-        };
-        let up_cost = up_shares * up_avg;
-        let down_cost = down_shares * down_avg;
-        let total_cost = up_cost + down_cost;
-
-        let duration_secs = snapshot.market_duration_secs;
-        let size = self.shares_for_market_with_time(market_name, time_remaining, duration_secs);
-
-        // Update price history and get trend (4–5 data points)
-        let trend = self.update_trend(&market_key, current_time, up_ask, down_ask).await;
-        let wave = self.wave_state.lock().await;
-        let wave_state = wave.get(&market_key).cloned().unwrap_or_default();
-        drop(wave);
-
-        let up_price_ok = up_ask >= self.min_side_price && up_ask <= self.max_side_price;
-        let down_price_ok = down_ask >= self.min_side_price && down_ask <= self.max_side_price;
-
-        let current_pairs = up_shares.min(down_shares);
-        let _current_cost_per_pair = if current_pairs > 0.0 {
-            total_cost / current_pairs
-        } else {
-            f64::MAX
-        };
-
-        let new_up = up_shares + size;
-        let new_up_cost = up_cost + size * up_ask;
-        let pairs_after_up = new_up.min(down_shares);
-        // When we have more Down than Up, only the paired Up cost counts (marginal cost per pair).
-        let cost_per_pair_up = if pairs_after_up > 0.0 {
-            if down_shares >= new_up {
-                (pairs_after_up * down_avg + new_up_cost) / pairs_after_up
-            } else {
-                (new_up_cost + down_cost) / pairs_after_up
-            }
-        } else {
-            f64::MAX
-        };
-
-        let new_down = down_shares + size;
-        let new_down_cost = down_cost + size * down_ask;
-        let pairs_after_down = up_shares.min(new_down);
-        // When we have more Up than Down, only the paired Up cost counts (marginal cost per pair).
-        let cost_per_pair_down = if pairs_after_down > 0.0 {
-            if up_shares >= new_down {
-                (pairs_after_down * up_avg + new_down_cost) / pairs_after_down
-            } else {
-                (up_cost + new_down_cost) / pairs_after_down
-            }
-        } else {
-            f64::MAX
-        };
-
-        // Trend-based decision
-        let can_lock_with_up = down_shares > 0.0 && pairs_after_up > 0.0 && cost_per_pair_up <= self.cost_per_pair_max;
-        let can_lock_with_down = up_shares > 0.0 && pairs_after_down > 0.0 && cost_per_pair_down <= self.cost_per_pair_max;
-
-        // PnL if each outcome wins: payout is that side's shares at $1 each.
-        let pnl_if_up_wins = up_shares - total_cost;
-        let pnl_if_down_wins = down_shares - total_cost;
-
-        let (do_buy_up, do_buy_down, is_lock) = if !up_price_ok && !down_price_ok {
-            (false, false, false)
-        } else if up_shares == 0.0 && down_shares == 0.0 {
-            // No position: rising → buy rising side 1–2x; flat → buy higher-priced side 3–4x
-            match trend {
-                Trend::UpRising if up_price_ok && wave_state.buys_up_since_lock < MAX_RISING_BUYS_NO_POSITION => (true, false, false),
-                Trend::DownRising if down_price_ok && wave_state.buys_down_since_lock < MAX_RISING_BUYS_NO_POSITION => (false, true, false),
-                Trend::Flat | Trend::UpFalling | Trend::DownFalling if wave_state.flat_buys_since_lock < MAX_FLAT_BUYS_NO_POSITION => {
-                    if up_ask >= down_ask && up_price_ok {
-                        (true, false, false)
-                    } else if down_price_ok {
-                        (false, true, false)
-                    } else {
-                        (false, false, false)
-                    }
-                }
-                _ => (false, false, false),
-            }
-        } else if down_shares > 0.0 && up_shares == 0.0 {
-            // Only Down: 1) lock with Up when cost per pair ≤ max; 2) Expansion: can't lock + UpRising + PnL Up worse → buy Up; 3) else buy Down if Down rising
-            if can_lock_with_up && up_price_ok {
-                (true, false, true)
-            } else if !can_lock_with_up && trend == Trend::UpRising && pnl_if_up_wins < pnl_if_down_wins && up_price_ok && wave_state.buys_up_since_lock < MAX_REBALANCE_BUYS {
-                // Expansion (Example 3 mirror): no lock with Up, Up rising, PnL if Up wins worse → buy Up to create position
-                (true, false, false)
-            } else if trend == Trend::DownRising && down_price_ok && wave_state.buys_down_since_lock < MAX_RISING_BUYS_PER_WAVE {
-                (false, true, false)
-            } else {
-                (false, false, false)
-            }
-        } else if up_shares > 0.0 && down_shares == 0.0 {
-            // Only Up: 1) lock with Down when cost per pair ≤ max; 2) Expansion (Example 3): can't lock + DownRising + PnL Down worse → buy Down; 3) else buy Up if Up rising
-            if can_lock_with_down && down_price_ok {
-                (false, true, true)
-            } else if !can_lock_with_down && trend == Trend::DownRising && pnl_if_down_wins < pnl_if_up_wins && down_price_ok && wave_state.buys_down_since_lock < MAX_REBALANCE_BUYS {
-                // Expansion: no matching Up can lock with Down @ current price, Down rising, PnL if Down wins lower → buy Down
-                (false, true, false)
-            } else if trend == Trend::UpRising && up_price_ok && wave_state.buys_up_since_lock < MAX_RISING_BUYS_PER_WAVE {
-                (true, false, false)
-            } else {
-                (false, false, false)
-            }
-        } else {
-            // Have both: 1) lock when cost per pair ≤ max; 2) Expansion (Example 5): can't lock + rising side PnL worse → buy that side; 3) ride winner; 4) PnL rebalance; 5) trend (not Flat — Example 6)
-            let underweight_down = up_shares > down_shares && can_lock_with_down && down_price_ok;
-            let underweight_up = down_shares > up_shares && can_lock_with_up && up_price_ok;
-            if underweight_down {
-                (false, true, true)
-            } else if underweight_up {
-                (true, false, true)
-            } else if trend != Trend::Flat && !can_lock_with_down && trend == Trend::DownRising && pnl_if_down_wins < pnl_if_up_wins && down_price_ok && wave_state.buys_down_since_lock < MAX_REBALANCE_BUYS {
-                // Expansion (Example 5): can't lock with Down, Down rising, PnL if Down wins worse → buy Down till it improves
-                (false, true, false)
-            } else if trend != Trend::Flat && !can_lock_with_up && trend == Trend::UpRising && pnl_if_up_wins < pnl_if_down_wins && up_price_ok && wave_state.buys_up_since_lock < MAX_REBALANCE_BUYS {
-                // Expansion: can't lock with Up, Up rising, PnL if Up wins worse → buy Up
-                (true, false, false)
-            } else if trend == Trend::UpRising
-                && trend != Trend::Flat
-                && up_price_ok
-                && cost_per_pair_up <= REBALANCE_COST_PER_PAIR_MAX
-                && wave_state.buys_up_since_lock < MAX_REBALANCE_BUYS
-            {
-                // Ride the winner (Example 4): Up is rising → buy Up to grow PnL if Up wins
-                (true, false, false)
-            } else if trend == Trend::DownRising
-                && trend != Trend::Flat
-                && down_price_ok
-                && cost_per_pair_down <= REBALANCE_COST_PER_PAIR_MAX
-                && wave_state.buys_down_since_lock < MAX_REBALANCE_BUYS
-            {
-                // Ride the winner: Down is rising → buy Down to grow PnL if Down wins
-                (false, true, false)
-            } else if trend != Trend::Flat
-                && pnl_if_down_wins < 0.0
-                && pnl_if_down_wins < pnl_if_up_wins
-                && trend != Trend::UpRising
-                && down_price_ok
-                && cost_per_pair_down <= REBALANCE_COST_PER_PAIR_MAX
-                && wave_state.buys_down_since_lock < MAX_REBALANCE_BUYS
-            {
-                // PnL rebalance: Down outcome negative and not riding Up → buy Down
-                (false, true, false)
-            } else if trend != Trend::Flat
-                && pnl_if_up_wins < 0.0
-                && pnl_if_up_wins < pnl_if_down_wins
-                && trend != Trend::DownRising
-                && up_price_ok
-                && cost_per_pair_up <= REBALANCE_COST_PER_PAIR_MAX
-                && wave_state.buys_up_since_lock < MAX_REBALANCE_BUYS
-            {
-                // PnL rebalance: Up outcome negative and not riding Down → buy Up
-                (true, false, false)
-            } else if trend == Trend::DownFalling && up_price_ok && wave_state.buys_up_since_lock < MAX_RISING_BUYS_PER_WAVE {
-                // Example 6: no buy on Flat; only DownFalling (not Flat) → buy Up
-                (true, false, false)
-            } else if trend == Trend::UpFalling && down_price_ok && wave_state.buys_down_since_lock < MAX_RISING_BUYS_PER_WAVE {
-                (false, true, false)
-            } else {
-                (false, false, false)
-            }
-        };
-
-        if !do_buy_up && !do_buy_down {
-            return Ok(());
-        }
-
-        let cooldown_secs = if snapshot.market_duration_secs >= 3600
-            || snapshot.market_name.to_uppercase().contains("1H")
+        // Update matched: current ask <= order price => filled (sim and prod use this for display; prod also syncs from API)
         {
-            self.cooldown_seconds_1h
-        } else {
-            self.cooldown_seconds
-        };
-        let mut last = self.last_buy.lock().await;
-        if let Some((ts, period)) = last.get(condition_id) {
-            if *period == period_timestamp && current_time < ts + cooldown_secs {
-                return Ok(());
-            }
-        }
-        if last.get(condition_id).map(|(_, p)| *p) != Some(period_timestamp) {
-            last.clear();
-        }
-        last.insert(condition_id.clone(), (current_time, period_timestamp));
-        drop(last);
-
-        let up_token_id = market_data.up_token.as_ref().map(|t| t.token_id.clone());
-        let down_token_id = market_data.down_token.as_ref().map(|t| t.token_id.clone());
-
-        if do_buy_up {
-            let cost_pp = if pairs_after_up > 0.0 { cost_per_pair_up } else { up_ask };
-            crate::log_println!(
-                "📈 {}: buy Up | ${:.4} x {:.2} | cost_per_pair {:.4} (max {:.2})",
-                market_name, up_ask, size, cost_pp, self.cost_per_pair_max
-            );
-            let (up_shares_after, up_avg_after, down_shares_after, down_avg_after, invest_up, invest_down, total_invest, pnl_if_up_wins, pnl_if_down_wins) = (
-                new_up,
-                new_up_cost / new_up,
-                down_shares,
-                if down_shares > 0.0 { down_avg } else { 0.0 },
-                new_up_cost,
-                down_cost,
-                new_up_cost + down_cost,
-                new_up - (new_up_cost + down_cost),
-                down_shares - (new_up_cost + down_cost),
-            );
-            crate::log_println!(
-                "   Position: Up {:.2} @ ${:.4} (invest ${:.2}) | Down {:.2} @ ${:.4} (invest ${:.2}) | total ${:.2} | PnL if Up wins ${:.2} | if Down wins ${:.2}",
-                up_shares_after, up_avg_after, invest_up,
-                down_shares_after, down_avg_after, invest_down,
-                total_invest, pnl_if_up_wins, pnl_if_down_wins
-            );
-            if self.simulation_mode {
-                self.record_trade(condition_id, period_timestamp, duration_secs, "Up", up_token_id.as_deref().unwrap_or(""), size, up_ask).await?;
-            } else if let Some(ref up_id) = up_token_id {
-                self.execute_buy_fak(market_name, "Up", up_id, size, up_ask).await?;
-                self.record_trade(condition_id, period_timestamp, duration_secs, "Up", up_id, size, up_ask).await?;
-            }
-        } else {
-            let cost_pp = if pairs_after_down > 0.0 { cost_per_pair_down } else { down_ask };
-            crate::log_println!(
-                "📉 {}: buy Down | ${:.4} x {:.2} | cost_per_pair {:.4} (max {:.2})",
-                market_name, down_ask, size, cost_pp, self.cost_per_pair_max
-            );
-            let (up_shares_after, up_avg_after, down_shares_after, down_avg_after, invest_up, invest_down, total_invest, pnl_if_up_wins, pnl_if_down_wins) = (
-                up_shares,
-                if up_shares > 0.0 { up_avg } else { 0.0 },
-                new_down,
-                new_down_cost / new_down,
-                up_cost,
-                new_down_cost,
-                up_cost + new_down_cost,
-                up_shares - (up_cost + new_down_cost),
-                new_down - (up_cost + new_down_cost),
-            );
-            crate::log_println!(
-                "   Position: Up {:.2} @ ${:.4} (invest ${:.2}) | Down {:.2} @ ${:.4} (invest ${:.2}) | total ${:.2} | PnL if Up wins ${:.2} | if Down wins ${:.2}",
-                up_shares_after, up_avg_after, invest_up,
-                down_shares_after, down_avg_after, invest_down,
-                total_invest, pnl_if_up_wins, pnl_if_down_wins
-            );
-            if self.simulation_mode {
-                self.record_trade(condition_id, period_timestamp, duration_secs, "Down", down_token_id.as_deref().unwrap_or(""), size, down_ask).await?;
-            } else if let Some(ref down_id) = down_token_id {
-                self.execute_buy_fak(market_name, "Down", down_id, size, down_ask).await?;
-                self.record_trade(condition_id, period_timestamp, duration_secs, "Down", down_id, size, down_ask).await?;
-            }
-        }
-
-        // Update wave state: reset on lock, else increment side or flat_buys
-        {
-            let mut wave = self.wave_state.lock().await;
-            let state = wave.entry(market_key.clone()).or_default();
-            if is_lock {
-                state.buys_up_since_lock = 0;
-                state.buys_down_since_lock = 0;
-                state.flat_buys_since_lock = 0;
-            } else {
-                let was_no_position = up_shares == 0.0 && down_shares == 0.0;
-                let is_flat_trend = trend == Trend::Flat || trend == Trend::UpFalling || trend == Trend::DownFalling;
-                if do_buy_up {
-                    state.buys_up_since_lock = (state.buys_up_since_lock + 1).min(MAX_RISING_BUYS_PER_WAVE);
-                    if was_no_position && is_flat_trend {
-                        state.flat_buys_since_lock = (state.flat_buys_since_lock + 1).min(MAX_FLAT_BUYS_NO_POSITION);
+            let mut batches = self.pending_batches.lock().await;
+            if let Some(batch_list) = batches.get_mut(&market_key) {
+                for batch in batch_list.iter_mut() {
+                    for o in batch.orders.iter_mut() {
+                        if o.matched {
+                            continue;
+                        }
+                        let filled = if o.side.eq_ignore_ascii_case("Up") {
+                            up_ask <= o.price + MATCH_EPSILON
+                        } else {
+                            down_ask <= o.price + MATCH_EPSILON
+                        };
+                        if filled {
+                            o.matched = true;
+                        }
                     }
                 }
-                if do_buy_down {
-                    state.buys_down_since_lock = (state.buys_down_since_lock + 1).min(MAX_RISING_BUYS_PER_WAVE);
-                    if was_no_position && is_flat_trend {
-                        state.flat_buys_since_lock = (state.flat_buys_since_lock + 1).min(MAX_FLAT_BUYS_NO_POSITION);
-                    }
+            }
+        }
+
+        self.log_matched_and_pnl(market_name, &market_key, up_ask, down_ask).await;
+
+        // Production: periodically sync position from fills API to confirm matched
+        const FILL_SYNC_INTERVAL_SECS: u64 = 20;
+        if !self.simulation_mode {
+            let do_sync = {
+                let mut sync_key = self.last_fill_sync.lock().await;
+                let do_sync = sync_key
+                    .get(&market_key)
+                    .map(|&t| current_time >= t.saturating_add(FILL_SYNC_INTERVAL_SECS))
+                    .unwrap_or(true);
+                if do_sync {
+                    sync_key.insert(market_key.clone(), current_time);
                 }
+                do_sync
+            };
+            if do_sync {
+                self.sync_position_and_log_pnl(
+                    market_name,
+                    condition_id,
+                    &market_key,
+                    period_timestamp,
+                    snapshot.market_duration_secs,
+                    market_data,
+                )
+                .await;
             }
         }
 
         Ok(())
     }
 
-    async fn execute_buy_fak(
+    pub async fn place_up_batch(&self, snapshot: &MarketSnapshot) -> Result<()> {
+        self.place_side_batch(snapshot, "Up").await
+    }
+
+    pub async fn place_down_batch(&self, snapshot: &MarketSnapshot) -> Result<()> {
+        self.place_side_batch(snapshot, "Down").await
+    }
+
+    async fn place_side_batch(&self, snapshot: &MarketSnapshot, side: &str) -> Result<()> {
+        let market_name = &snapshot.market_name;
+        let market_data = &snapshot.btc_market_15m;
+        let period_timestamp = snapshot.btc_15m_period_timestamp;
+        let condition_id = &market_data.condition_id;
+        let market_key = format!("{}:{}", condition_id, period_timestamp);
+        let duration_secs = snapshot.market_duration_secs;
+
+        let (token_id, ask) = if side.eq_ignore_ascii_case("Up") {
+            let tid = market_data.up_token.as_ref().map(|t| t.token_id.clone());
+            let a = market_data
+                .up_token
+                .as_ref()
+                .and_then(|t| t.ask_price().to_string().parse::<f64>().ok())
+                .unwrap_or(0.0);
+            (tid, a)
+        } else {
+            let tid = market_data.down_token.as_ref().map(|t| t.token_id.clone());
+            let a = market_data
+                .down_token
+                .as_ref()
+                .and_then(|t| t.ask_price().to_string().parse::<f64>().ok())
+                .unwrap_or(0.0);
+            (tid, a)
+        };
+
+        let token_id = match token_id {
+            Some(id) => id,
+            None => return Ok(()),
+        };
+        if ask <= 0.0 {
+            return Ok(());
+        }
+
+        let price = (ask + 0.01).min(self.max_side_price).max(self.min_side_price);
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        crate::log_println!(
+            "📊 {}: placing {} limit buy {} @ ${:.4} x {} shares each (ask+0.01)",
+            market_name, self.batch_count, side, price, self.shares_per_limit_order
+        );
+        let ids = self
+            .place_limit_order_batch(market_name, side, &token_id, price, duration_secs)
+            .await?;
+
+        let size = self.shares_per_limit_order;
+        let mut orders = Vec::with_capacity(self.batch_count);
+        for i in 0..self.batch_count {
+            orders.push(PendingOrder {
+                side: side.to_string(),
+                price,
+                size,
+                order_id: ids.get(i).cloned(),
+                matched: false,
+            });
+        }
+        let batch = PendingBatch {
+            placed_at: current_time,
+            orders,
+        };
+        self.pending_batches
+            .lock()
+            .await
+            .entry(market_key)
+            .or_default()
+            .push_back(batch);
+
+        Ok(())
+    }
+
+    /// Cancel all open Up limit orders for the market in the snapshot (production: API cancel; sim: remove from tracking).
+    pub async fn cancel_up_orders(&self, snapshot: &MarketSnapshot) -> Result<()> {
+        self.cancel_side_orders(snapshot, "Up").await
+    }
+
+    /// Cancel all open Down limit orders for the market in the snapshot.
+    pub async fn cancel_down_orders(&self, snapshot: &MarketSnapshot) -> Result<()> {
+        self.cancel_side_orders(snapshot, "Down").await
+    }
+
+    async fn cancel_side_orders(&self, snapshot: &MarketSnapshot, side: &str) -> Result<()> {
+        let market_name = &snapshot.market_name;
+        let market_data = &snapshot.btc_market_15m;
+        let period_timestamp = snapshot.btc_15m_period_timestamp;
+        let condition_id = &market_data.condition_id;
+        let market_key = format!("{}:{}", condition_id, period_timestamp);
+
+        let to_cancel: Vec<String> = {
+            let mut batches = self.pending_batches.lock().await;
+            let list = match batches.get_mut(&market_key) {
+                Some(l) => l,
+                None => {
+                    crate::log_println!("  {} | No pending orders to cancel for {}", market_name, side);
+                    return Ok(());
+                }
+            };
+            let mut ids = Vec::new();
+            for batch in list.iter() {
+                for o in &batch.orders {
+                    if o.side.eq_ignore_ascii_case(side) && !o.matched {
+                        if let Some(ref id) = o.order_id {
+                            ids.push(id.clone());
+                        }
+                    }
+                }
+            }
+            ids
+        };
+
+        if to_cancel.is_empty() {
+            crate::log_println!("  {} | No open {} orders to cancel", market_name, side);
+            return Ok(());
+        }
+
+        if !self.simulation_mode {
+            if let Err(e) = self.api.cancel_orders(&to_cancel).await {
+                warn!("Failed to cancel {} orders: {}", side, e);
+                return Err(e.into());
+            }
+        }
+        crate::log_println!("  {} | Cancelled {} {} order(s)", market_name, to_cancel.len(), side);
+
+        // Remove those orders from tracking (drop unmatched orders of this side)
+        let mut batches = self.pending_batches.lock().await;
+        if let Some(list) = batches.get_mut(&market_key) {
+            for batch in list.iter_mut() {
+                batch.orders.retain(|o| !(o.side.eq_ignore_ascii_case(side) && !o.matched));
+            }
+            list.retain(|b| !b.orders.is_empty());
+        }
+        Ok(())
+    }
+
+    async fn log_matched_and_pnl(&self, market_name: &str, market_key: &str, _up_ask: f64, _down_ask: f64) {
+        let state = {
+            let batches = self.pending_batches.lock().await;
+            let (mut up_shares, mut down_shares, mut total_deposit, mut unmatched) =
+                (0.0_f64, 0.0_f64, 0.0_f64, 0usize);
+            if let Some(list) = batches.get(market_key) {
+                for batch in list.iter() {
+                    for o in &batch.orders {
+                        if o.matched {
+                            total_deposit += o.price * o.size;
+                            if o.side.eq_ignore_ascii_case("Up") {
+                                up_shares += o.size;
+                            } else {
+                                down_shares += o.size;
+                            }
+                        } else {
+                            unmatched += 1;
+                        }
+                    }
+                }
+            }
+            (up_shares, down_shares, unmatched, total_deposit)
+        };
+        let total_matched = state.0 + state.1;
+        if total_matched <= 0.0 && state.2 == 0 {
+            return;
+        }
+        let last = self.last_pnl_log.lock().await;
+        let same = last
+            .get(market_key)
+            .map(|&(a, b, c, d)| {
+                (state.0 - a).abs() < 1e-6
+                    && (state.1 - b).abs() < 1e-6
+                    && state.2 == c
+                    && (state.3 - d).abs() < 1e-6
+            })
+            .unwrap_or(false);
+        if same {
+            return;
+        }
+        drop(last);
+        {
+            let mut last = self.last_pnl_log.lock().await;
+            last.insert(market_key.to_string(), (state.0, state.1, state.2, state.3));
+        }
+        let pnl_up = state.0 - state.3;
+        let pnl_down = state.1 - state.3;
+        crate::log_println!(
+            "  {} | Holding: {:.0} Up, {:.0} Down | Unmatched: {} | Total deposit: ${:.2} | PnL if Up wins: ${:.2} | if Down wins: ${:.2}",
+            market_name, state.0, state.1, state.2, state.3, pnl_up, pnl_down
+        );
+    }
+
+    async fn sync_position_and_log_pnl(
+        &self,
+        market_name: &str,
+        condition_id: &str,
+        market_key: &str,
+        period_timestamp: u64,
+        market_duration_secs: u64,
+        market_data: &crate::models::MarketData,
+    ) {
+        let up_token_id = market_data.up_token.as_ref().map(|t| t.token_id.as_str());
+        let down_token_id = market_data.down_token.as_ref().map(|t| t.token_id.as_str());
+        let up_token_id_owned = up_token_id.map(|s| s.to_string());
+        let down_token_id_owned = down_token_id.map(|s| s.to_string());
+
+        let user = match self.api.get_trading_address() {
+            Ok(u) => u,
+            Err(_) => return,
+        };
+
+        let fills = match self
+            .api
+            .get_user_fills_for_market(&user, condition_id, Some(200))
+            .await
+        {
+            Ok(f) => f,
+            Err(e) => {
+                log::debug!("{} fill sync failed: {}", market_name, e);
+                return;
+            }
+        };
+
+        let mut up_shares = 0.0_f64;
+        let mut down_shares = 0.0_f64;
+        let mut up_cost = 0.0_f64;
+        let mut down_cost = 0.0_f64;
+
+        for fill in &fills {
+            if fill.side.to_uppercase() != "BUY" {
+                continue;
+            }
+            let size = fill.size;
+            let cost = size * fill.price;
+            let is_up = fill
+                .outcome
+                .as_deref()
+                .map(|o| o.eq_ignore_ascii_case("up"))
+                .unwrap_or_else(|| {
+                    fill
+                        .get_token_id()
+                        .map(|tid| up_token_id == Some(tid.as_str()))
+                        .unwrap_or(false)
+                });
+            let is_down = fill
+                .outcome
+                .as_deref()
+                .map(|o| o.eq_ignore_ascii_case("down"))
+                .unwrap_or_else(|| {
+                    fill
+                        .get_token_id()
+                        .map(|tid| down_token_id == Some(tid.as_str()))
+                        .unwrap_or(false)
+                });
+            if is_up {
+                up_shares += size;
+                up_cost += cost;
+            } else if is_down {
+                down_shares += size;
+                down_cost += cost;
+            }
+        }
+
+        let total_cost = up_cost + down_cost;
+        let pnl_if_up_wins = up_shares - total_cost;
+        let pnl_if_down_wins = down_shares - total_cost;
+
+        if up_shares > 0.0 || down_shares > 0.0 {
+            crate::log_println!(
+                "  {} | Position (from API): Up {:.2} @ ${:.2} cost | Down {:.2} @ ${:.2} cost | Total ${:.2} | PnL if Up wins: ${:.2} | if Down wins: ${:.2}",
+                market_name,
+                up_shares,
+                up_cost,
+                down_shares,
+                down_cost,
+                total_cost,
+                pnl_if_up_wins,
+                pnl_if_down_wins
+            );
+        }
+
+        if up_shares > 0.0 || down_shares > 0.0 {
+            let up_avg = if up_shares > 0.0 {
+                up_cost / up_shares
+            } else {
+                0.0
+            };
+            let down_avg = if down_shares > 0.0 {
+                down_cost / down_shares
+            } else {
+                0.0
+            };
+            let mut trades = self.trades.lock().await;
+            trades.insert(
+                market_key.to_string(),
+                CycleTrade {
+                    condition_id: condition_id.to_string(),
+                    period_timestamp,
+                    market_duration_secs,
+                    up_token_id: up_token_id_owned,
+                    down_token_id: down_token_id_owned,
+                    up_shares,
+                    down_shares,
+                    up_avg_price: up_avg,
+                    down_avg_price: down_avg,
+                },
+            );
+        }
+    }
+
+    async fn place_limit_order_batch(
         &self,
         market_name: &str,
         side: &str,
         token_id: &str,
-        shares: f64,
         price: f64,
-    ) -> Result<()> {
-        crate::log_println!(
-            "{} BUY {} {:.2} shares @ ${:.4} (FAK - partial fill possible)",
-            market_name, side, shares, price
-        );
-        let shares_rounded = (shares * 10000.0).round() / 10000.0;
-        match self
-            .api
-            .place_market_order(token_id, shares_rounded, "BUY", Some("FAK"))
-            .await
-        {
-            Ok(_) => crate::log_println!("REAL: FAK order placed"),
-            Err(e) => {
-                warn!("Failed to place FAK order: {}", e);
-                return Err(e.into());
+        _duration_secs: u64,
+    ) -> Result<Vec<String>> {
+        let mut order_ids = Vec::with_capacity(self.batch_count);
+        let size = self.shares_per_limit_order;
+        let price_str = format!("{:.4}", price);
+
+        for i in 0..self.batch_count {
+            if self.simulation_mode {
+                crate::log_println!(
+                    "  [SIM] Limit BUY {} #{}/{} @ ${} x {}",
+                    side,
+                    i + 1,
+                    self.batch_count,
+                    price_str,
+                    size
+                );
+                continue;
+            }
+            let order = crate::models::OrderRequest {
+                token_id: token_id.to_string(),
+                side: "BUY".to_string(),
+                size: format!("{:.4}", size),
+                price: price_str.clone(),
+                order_type: "LIMIT".to_string(),
+            };
+            match self.api.place_order(&order).await {
+                Ok(resp) => {
+                    if let Some(id) = resp.order_id {
+                        crate::log_println!("  {} limit order #{} placed: {}", market_name, i + 1, id);
+                        order_ids.push(id);
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to place limit order #{}: {}", i + 1, e);
+                }
             }
         }
-        Ok(())
+        Ok(order_ids)
     }
 
-    async fn record_trade(
-        &self,
-        condition_id: &str,
-        period_timestamp: u64,
-        market_duration_secs: u64,
-        side: &str,
-        token_id: &str,
-        shares: f64,
-        price: f64,
-    ) -> Result<()> {
-        let market_key = format!("{}:{}", condition_id, period_timestamp);
-        let mut trades = self.trades.lock().await;
-        let trade = trades.entry(market_key.clone()).or_insert_with(|| CycleTrade {
-            condition_id: condition_id.to_string(),
-            period_timestamp,
-            market_duration_secs,
-            up_token_id: None,
-            down_token_id: None,
-            up_shares: 0.0,
-            down_shares: 0.0,
-            up_avg_price: 0.0,
-            down_avg_price: 0.0,
-        });
-        match side {
-            "Up" => {
-                let old = trade.up_shares * trade.up_avg_price;
-                trade.up_shares += shares;
-                trade.up_avg_price = if trade.up_shares > 0.0 {
-                    (old + shares * price) / trade.up_shares
-                } else {
-                    price
-                };
-                trade.up_token_id = Some(token_id.to_string());
-            }
-            "Down" => {
-                let old = trade.down_shares * trade.down_avg_price;
-                trade.down_shares += shares;
-                trade.down_avg_price = if trade.down_shares > 0.0 {
-                    (old + shares * price) / trade.down_shares
-                } else {
-                    price
-                };
-                trade.down_token_id = Some(token_id.to_string());
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    /// Check closed markets and compute PnL from the actual winning token (after resolution).
-    /// In simulation this is the only place PnL is calculated; same logic in production.
     pub async fn check_market_closure(&self) -> Result<()> {
         let trades: Vec<(String, CycleTrade)> = {
             let t = self.trades.lock().await;
@@ -630,7 +582,8 @@ impl Trader {
                 .map(|id| market.tokens.iter().any(|t| t.token_id == *id && t.winner))
                 .unwrap_or(false);
 
-            let total_cost = (trade.up_shares * trade.up_avg_price) + (trade.down_shares * trade.down_avg_price);
+            let total_cost =
+                (trade.up_shares * trade.up_avg_price) + (trade.down_shares * trade.down_avg_price);
             let payout = if up_wins {
                 trade.up_shares * 1.0
             } else if down_wins {
@@ -640,7 +593,13 @@ impl Trader {
             };
             let pnl = payout - total_cost;
 
-            let winner = if up_wins { "Up" } else if down_wins { "Down" } else { "Unknown" };
+            let winner = if up_wins {
+                "Up"
+            } else if down_wins {
+                "Down"
+            } else {
+                "Unknown"
+            };
             crate::log_println!("=== Market resolved ===");
             crate::log_println!(
                 "Market closed | condition {} | Winner: {} | Up {:.2} @ {:.4} | Down {:.2} @ {:.4} | Cost ${:.2} | Payout ${:.2} | Actual PnL ${:.2}",
@@ -661,7 +620,6 @@ impl Trader {
                 } else {
                     (trade.down_token_id.as_deref().unwrap_or(""), "Down")
                 };
-                let _units = if up_wins { trade.up_shares } else { trade.down_shares };
                 if let Err(e) = self
                     .api
                     .redeem_tokens(&trade.condition_id, token_id, outcome)
@@ -696,8 +654,6 @@ impl Trader {
     }
 
     pub async fn reset_period(&self) {
-        let mut last = self.last_buy.lock().await;
-        last.clear();
         let mut c = self.closure_checked.lock().await;
         c.clear();
         crate::log_println!("Period reset");
@@ -709,5 +665,36 @@ impl Trader {
 
     pub async fn get_period_profit(&self) -> f64 {
         *self.period_profit.lock().await
+    }
+
+    /// Returns (Up matched batch prices, Down matched batch prices) for the price feed "bought" display.
+    /// One price per batch (not per order), so one batch of 5 orders at $0.52 shows as $0.52 once.
+    pub async fn get_matched_bought_prices(&self, market_key: &str) -> (Vec<f64>, Vec<f64>) {
+        let batches = self.pending_batches.lock().await;
+        let mut up_prices = Vec::new();
+        let mut down_prices = Vec::new();
+        if let Some(list) = batches.get(market_key) {
+            for batch in list.iter() {
+                let mut up_added = false;
+                let mut down_added = false;
+                for o in &batch.orders {
+                    if !o.matched {
+                        continue;
+                    }
+                    if o.side.eq_ignore_ascii_case("Up") {
+                        if !up_added {
+                            up_prices.push(o.price);
+                            up_added = true;
+                        }
+                    } else {
+                        if !down_added {
+                            down_prices.push(o.price);
+                            down_added = true;
+                        }
+                    }
+                }
+            }
+        }
+        (up_prices, down_prices)
     }
 }

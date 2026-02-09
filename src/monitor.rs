@@ -35,6 +35,8 @@ pub struct MarketSnapshot {
     pub btc_15m_period_timestamp: u64,
     /// Market duration in seconds (900 for 15m, 3600 for 1h).
     pub market_duration_secs: u64,
+    /// Win probabilities from Gamma outcomePrices (Up, Down). None if Gamma fetch failed.
+    pub outcome_prices: Option<crate::models::OutcomePrices>,
 }
 
 impl MarketMonitor {
@@ -73,8 +75,8 @@ impl MarketMonitor {
         &self,
         btc_market_15m: crate::models::Market,
     ) -> Result<()> {
-        eprintln!("Updating {} market...", self.market_name);
-        eprintln!("New {} Market: {} ({})", self.market_name, btc_market_15m.slug, btc_market_15m.condition_id);
+        crate::log_println!("Updating {} market...", self.market_name);
+        crate::log_println!("New {} Market: {} ({})", self.market_name, btc_market_15m.slug, btc_market_15m.condition_id);
         let period_duration_secs = Self::extract_duration_from_slug(&btc_market_15m.slug);
         
         *self.btc_market_15m.lock().await = btc_market_15m;
@@ -144,16 +146,16 @@ impl MarketMonitor {
                     let outcome_upper = token.outcome.to_uppercase();
                     if outcome_upper.contains("UP") || outcome_upper == "1" {
                         *self.btc_15m_up_token_id.lock().await = Some(token.token_id.clone());
-                        eprintln!("{} Up token_id: {}", self.market_name, token.token_id);
+                        crate::log_println!("{} Up token_id: {}", self.market_name, token.token_id);
                     } else if outcome_upper.contains("DOWN") || outcome_upper == "0" {
                         *self.btc_15m_down_token_id.lock().await = Some(token.token_id.clone());
-                        eprintln!("{} Down token_id: {}", self.market_name, token.token_id);
+                        crate::log_println!("{} Down token_id: {}", self.market_name, token.token_id);
                     }
                 }
             }
             Err(e) => {
                 warn!("{}: Failed to fetch market details from CLOB (token IDs will be N/A until next refresh): {}", self.market_name, e);
-                eprintln!("{}: CLOB get_market FAILED: {} (prices will show N/A until CLOB returns this market)", self.market_name, e);
+                crate::log_println!("{}: CLOB get_market FAILED: {} (prices will show N/A until CLOB returns this market)", self.market_name, e);
             }
         }
 
@@ -224,7 +226,7 @@ impl MarketMonitor {
             }
         };
         
-        let btc_15m_remaining_str = format_remaining_time(btc_15m_remaining);
+        let _btc_15m_remaining_str = format_remaining_time(btc_15m_remaining);
         let format_price_with_both = |p: &TokenPrice| -> String {
             let bid = p.bid.unwrap_or(rust_decimal::Decimal::ZERO);
             let ask = p.ask.unwrap_or(rust_decimal::Decimal::ZERO);
@@ -233,22 +235,15 @@ impl MarketMonitor {
             format!("BID:${:.2} ASK:${:.2}", bid_f64, ask_f64)
         };
 
-        let btc_15m_up_str = btc_15m_up_price.as_ref()
+        let _btc_15m_up_str = btc_15m_up_price.as_ref()
             .map(format_price_with_both)
             .unwrap_or_else(|| "N/A".to_string());
-        let btc_15m_down_str = btc_15m_down_price.as_ref()
+        let _btc_15m_down_str = btc_15m_down_price.as_ref()
             .map(format_price_with_both)
             .unwrap_or_else(|| "N/A".to_string());
-        
-        let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S");
-        let message = format!(
-            "[{}] {} Up Token {} Down Token {} remaining time:{}\n",
-            ts, self.market_name, btc_15m_up_str, btc_15m_down_str, btc_15m_remaining_str
-        );
-        crate::log_to_history(&message);
 
         let btc_15m_market_data = MarketData {
-            condition_id: btc_15m_id,
+            condition_id: btc_15m_id.clone(),
             market_name: self.market_name.clone(),
             up_token: btc_15m_up_price,
             down_token: btc_15m_down_price,
@@ -261,6 +256,7 @@ impl MarketMonitor {
             btc_15m_time_remaining: btc_15m_remaining,
             btc_15m_period_timestamp: btc_15m_timestamp,
             market_duration_secs,
+            outcome_prices: None,
         })
     }
 
@@ -410,7 +406,7 @@ impl MarketMonitor {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<MarketSnapshot>();
         let callback_arc = Arc::new(callback);
         
-        let callback_task = {
+        let _callback_task = {
             let callback_ref = callback_arc.clone();
             tokio::spawn(async move {
                 while let Some(snapshot) = rx.recv().await {
@@ -439,11 +435,11 @@ impl MarketMonitor {
             }
 
             let ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
-            eprintln!("Connecting to WebSocket: {}", ws_url);
+            crate::log_println!("Connecting to WebSocket: {}", ws_url);
 
             match connect_async(ws_url).await {
                 Ok((ws_stream, _)) => {
-                    eprintln!("WebSocket connected successfully");
+                    crate::log_println!("WebSocket connected successfully");
                     let (mut write, mut read) = ws_stream.split();
 
                     let up_id = up_token_id.clone().unwrap();
@@ -537,9 +533,12 @@ impl MarketMonitor {
                 }
             }
         }
-        
-        drop(tx);
-        let _ = callback_task.await;
+        // Unreachable: outer loop reconnects forever. If loop is ever exited, close channel and wait for callback.
+        #[allow(unreachable_code)]
+        {
+            drop(tx);
+            let _ = _callback_task.await;
+        }
     }
 
 
@@ -704,7 +703,7 @@ impl MarketMonitor {
             }
         };
 
-        let btc_15m_remaining_str = format_remaining_time(btc_15m_remaining);
+        let _btc_15m_remaining_str = format_remaining_time(btc_15m_remaining);
         let format_price_with_both = |p: &TokenPrice| -> String {
             let bid = p.bid.unwrap_or(rust_decimal::Decimal::ZERO);
             let ask = p.ask.unwrap_or(rust_decimal::Decimal::ZERO);
@@ -713,19 +712,12 @@ impl MarketMonitor {
             format!("BID:${:.2} ASK:${:.2}", bid_f64, ask_f64)
         };
 
-        let btc_15m_up_str = up_price.as_ref()
+        let _btc_15m_up_str = up_price.as_ref()
             .map(format_price_with_both)
             .unwrap_or_else(|| "N/A".to_string());
-        let btc_15m_down_str = down_price.as_ref()
+        let _btc_15m_down_str = down_price.as_ref()
             .map(format_price_with_both)
             .unwrap_or_else(|| "N/A".to_string());
-        
-        let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S");
-        let message = format!(
-            "[{}] {} Up Token {} Down Token {} remaining time:{}\n",
-            ts, self.market_name, btc_15m_up_str, btc_15m_down_str, btc_15m_remaining_str
-        );
-        crate::log_to_history(&message);
 
         let btc_15m_market_data = MarketData {
             condition_id: btc_15m_id,
@@ -741,6 +733,7 @@ impl MarketMonitor {
             btc_15m_time_remaining: btc_15m_remaining,
             btc_15m_period_timestamp: btc_15m_timestamp,
             market_duration_secs: btc_15m_duration,
+            outcome_prices: None,
         })
     }
 }

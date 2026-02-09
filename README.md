@@ -1,6 +1,6 @@
-# Polymarket Arbitrage Trading Bot – BTC (&ETH) Binary Markets
+# Polymarket Trading Bot – BTC (&ETH) Binary Markets
 
-**Rust trading bot for Polymarket prediction markets.** Automates hedging and position management on BTC and ETH binary (Up/Down) markets with 15m and 1h timeframes. Lock profit when cost per pair is favorable; expand positions when the opposite side is rising and PnL is skewed.
+**Rust trading bot for Polymarket prediction markets.** Trades BTC and ETH binary (Up/Down) markets (15m and 1h) using **outcome prices** (win probabilities from Gamma) and **token price trend**. Places batches of limit orders on the side that is both winning by outcome price and rising in price over N datapoints.
 
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 [![Polymarket](https://img.shields.io/badge/Polymarket-CLOB-blue)](https://polymarket.com)
@@ -71,13 +71,14 @@ cp config.example.json config.json
 |--------|-------------|---------|
 | `markets` | Assets to trade | `["btc", "eth"]` |
 | `timeframes` | Periods | `["15m", "1h"]` |
-| `cost_per_pair_max` | Max cost per pair when locking | `0.99` |
-| `min_side_price` | Don’t buy below this ask | `0.05` |
-| `max_side_price` | Don’t buy above this ask | `0.99` |
-| `cooldown_seconds` | Min seconds between buys (15m) | `0` |
-| `cooldown_seconds_1h` | Min seconds between buys (1h) | `30` or `45` |
-| `shares` | Override size per order; `null` = per-market default | `null` |
-| `size_reduce_after_secs` | Start reducing size in last N seconds | `300` |
+| `trend_datapoints` | Number of price points to confirm "rising" trend | `7` |
+| `trend_datapoints_extended` | Longer window when market unclear (reserved) | `15` |
+| `batch_count` | Number of limit orders per batch | `5` |
+| `shares_per_limit_order` | Shares per limit order in batch | `30` |
+| `limit_order_price_offset_down` | Price offset for Down orders (e.g. −0.02) | `-0.02` |
+| `cancel_unmatched_after_secs` | Cancel placed limit orders after N s (production only); 0 = never | `120` |
+| `min_side_price` | Don’t place orders below this ask | `0.05` |
+| `max_side_price` | Don’t place orders above this ask | `0.99` |
 | `market_closure_check_interval_seconds` | How often to check for resolved markets | `20` |
 
 ---
@@ -118,15 +119,15 @@ Logs go to `history.toml` (and your configured log target). Price lines look lik
 .
 ├── Cargo.toml
 ├── config.json          # Your config (gitignored); use config.example.json as template
-├── logic.md              # Strategy examples (lock, expansion, ride winner, flat)
+├── logic.md              # Legacy strategy examples (reference)
 ├── history.toml          # Append-only trade/price log (gitignored in default .gitignore)
 ├── src/
 │   ├── main.rs           # CLI, config load, monitor + trader spawn
 │   ├── config.rs         # Config and defaults
-│   ├── api.rs            # Polymarket Gamma + CLOB API
-│   ├── monitor.rs        # Price feed, snapshot, timestamps
-│   ├── trader.rs         # Lock/expansion/ride-winner/PnL logic
-│   └── models.rs         # API and market data types
+│   ├── api.rs            # Polymarket Gamma + CLOB API (markets/slug, limit orders, cancel)
+│   ├── monitor.rs        # Price feed + Gamma outcome prices, snapshot, timestamps
+│   ├── trader.rs         # Outcome-price + trend → batch limit orders; cancel unmatched
+│   └── models.rs         # API and market data types (incl. outcome prices)
 └── README.md
 ```
 

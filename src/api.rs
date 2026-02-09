@@ -282,6 +282,19 @@ impl PolymarketApi {
         anyhow::bail!("Invalid market response format: no markets array found")
     }
 
+    /// Gamma GET /markets/slug/{slug} - single market with outcomePrices (win probabilities).
+    pub async fn get_gamma_market_by_slug(&self, slug: &str) -> Result<crate::models::GammaMarketBySlug> {
+        let url = format!("{}/markets/slug/{}", self.gamma_url, slug);
+        let response = self.client.get(&url).send().await
+            .context(format!("Failed to fetch Gamma market by slug: {}", slug))?;
+        if !response.status().is_success() {
+            anyhow::bail!("Gamma market by slug failed: {} (status: {})", slug, response.status());
+        }
+        let market: crate::models::GammaMarketBySlug = response.json().await
+            .context("Failed to parse Gamma market response")?;
+        Ok(market)
+    }
+
     /// Address used for trading (proxy wallet if set, else EOA from private key). Used for position/balance lookups.
     pub fn get_trading_address(&self) -> Result<String> {
         if let Some(ref addr) = self.proxy_wallet_address {
@@ -563,6 +576,46 @@ impl PolymarketApi {
         eprintln!("Order placed successfully! Order ID: {}", response.order_id);
         
         Ok(order_response)
+    }
+
+    /// Cancel one or more limit orders by ID (production only). No-op if order_ids is empty.
+    pub async fn cancel_orders(&self, order_ids: &[String]) -> Result<()> {
+        if order_ids.is_empty() {
+            return Ok(());
+        }
+        let private_key = self.private_key.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Private key required to cancel orders"))?;
+        let signer = LocalSigner::from_str(private_key)
+            .context("Failed to create signer from private key")?
+            .with_chain_id(Some(POLYGON));
+        let mut auth_builder = ClobClient::new(&self.clob_url, ClobConfig::default())
+            .context("Failed to create CLOB client")?
+            .authentication_builder(&signer);
+        if let Some(proxy_addr) = &self.proxy_wallet_address {
+            let funder_address = AlloyAddress::parse_checksummed(proxy_addr, None)
+                .context("Failed to parse proxy_wallet_address")?;
+            auth_builder = auth_builder.funder(funder_address);
+            let sig_type = match self.signature_type {
+                Some(1) => SignatureType::Proxy,
+                Some(2) => SignatureType::GnosisSafe,
+                Some(0) | None => SignatureType::Proxy,
+                Some(n) => anyhow::bail!("Invalid signature_type: {}", n),
+            };
+            auth_builder = auth_builder.signature_type(sig_type);
+        } else if let Some(sig_type_num) = self.signature_type {
+            let sig_type = match sig_type_num {
+                0 => SignatureType::Eoa,
+                1 | 2 => anyhow::bail!("signature_type {} requires proxy_wallet_address", sig_type_num),
+                n => anyhow::bail!("Invalid signature_type: {}", n),
+            };
+            auth_builder = auth_builder.signature_type(sig_type);
+        }
+        let client = auth_builder.authenticate().await
+            .context("Failed to authenticate for cancel_orders")?;
+        let refs: Vec<&str> = order_ids.iter().map(String::as_str).collect();
+        client.cancel_orders(&refs).await
+            .context("Failed to cancel orders")?;
+        Ok(())
     }
 
     pub async fn place_market_order(
@@ -1167,23 +1220,20 @@ impl PolymarketApi {
             .map(|t| t.token_id.clone())
             .collect();
         
-        eprintln!("Market has {} tokens: {:?}", market_token_ids.len(), market_token_ids);
+        log::debug!("Market has {} tokens", market_token_ids.len());
         
         // Fetch fills for user filtered by this market's condition_id
         let all_fills = self.get_user_fills(user_address, Some(condition_id), limit).await?;
         
         // Filter fills to only include tokens from this market
-        // Data API returns conditionId in the fill, so we can filter by that
         let market_fills: Vec<crate::models::Fill> = all_fills
             .into_iter()
             .filter(|fill| {
-                // Filter by condition_id if available
                 if let Some(fill_cond_id) = &fill.condition_id {
                     if fill_cond_id == condition_id {
                         return true;
                     }
                 }
-                // Fallback: filter by token_id matching market tokens
                 if let Some(token_id) = fill.get_token_id() {
                     market_token_ids.contains(token_id)
                 } else {
@@ -1192,8 +1242,7 @@ impl PolymarketApi {
             })
             .collect();
         
-        eprintln!("Found {} fills for market {} (condition_id: {})", 
-                  market_fills.len(), market.question, condition_id);
+        log::debug!("Found {} fills for market {}", market_fills.len(), condition_id);
         
         Ok(market_fills)
     }

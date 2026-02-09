@@ -12,12 +12,17 @@ use config::{Args, Config};
 use log::warn;
 use std::io::{self, Write};
 use std::sync::Arc;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, mpsc};
 use std::fs::{File, OpenOptions};
 
 use api::PolymarketApi;
-use monitor::MarketMonitor;
+use monitor::{MarketMonitor, MarketSnapshot};
 use trader::Trader;
+use crate::models::TokenPrice;
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+
+/// ANSI: move cursor to column 1. Prepended to stderr so terminal shows each line from the left.
+const CURSOR_COL1: &[u8] = b"\x1b[1G";
 
 struct DualWriter {
     stderr: io::Stderr,
@@ -26,7 +31,18 @@ struct DualWriter {
 
 impl Write for DualWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let _ = self.stderr.write_all(buf);
+        let _guard = TERM_LOCK.lock().unwrap();
+        let mut stderr_buf = Vec::with_capacity(buf.len() + 64);
+        if !buf.is_empty() && buf[0] != b'\r' {
+            stderr_buf.push(b'\r');
+        }
+        for (i, &b) in buf.iter().enumerate() {
+            if b == b'\n' && (i == 0 || buf[i - 1] != b'\r') {
+                stderr_buf.push(b'\r');
+            }
+            stderr_buf.push(b);
+        }
+        let _ = self.stderr.write_all(&stderr_buf);
         let _ = self.stderr.flush();
         let mut file = self.file.lock().unwrap();
         file.write_all(buf)?;
@@ -35,6 +51,7 @@ impl Write for DualWriter {
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        let _guard = TERM_LOCK.lock().unwrap();
         self.stderr.flush()?;
         let mut file = self.file.lock().unwrap();
         file.flush()?;
@@ -46,19 +63,90 @@ unsafe impl Send for DualWriter {}
 unsafe impl Sync for DualWriter {}
 
 static HISTORY_FILE: OnceLock<Mutex<File>> = OnceLock::new();
+/// Serializes all terminal output so price feed and log lines don't interleave.
+static TERM_LOCK: Mutex<()> = Mutex::new(());
 
 fn init_history_file(file: File) {
     HISTORY_FILE.set(Mutex::new(file)).expect("History file already initialized");
 }
 
 pub fn log_to_history(message: &str) {
-    eprint!("{}", message);
+    let _guard = TERM_LOCK.lock().unwrap();
+    let mut term_msg = String::with_capacity(message.len() + 64);
+    term_msg.push_str(std::str::from_utf8(CURSOR_COL1).unwrap_or(""));
+    for (i, c) in message.chars().enumerate() {
+        term_msg.push(c);
+        if c == '\n' && i + 1 < message.len() {
+            term_msg.push_str(std::str::from_utf8(CURSOR_COL1).unwrap_or(""));
+        }
+    }
+    eprint!("{}", term_msg);
     let _ = io::stderr().flush();
     if let Some(file_mutex) = HISTORY_FILE.get() {
         if let Ok(mut file) = file_mutex.lock() {
             let _ = write!(file, "{}", message);
             let _ = file.flush();
         }
+    }
+}
+
+fn format_token_price(p: &TokenPrice) -> String {
+    let bid = p.bid.as_ref().map(|d| d.to_string().parse::<f64>().unwrap_or(0.0)).unwrap_or(0.0);
+    let ask = p.ask.as_ref().map(|d| d.to_string().parse::<f64>().unwrap_or(0.0)).unwrap_or(0.0);
+    format!("BID:${:.2} ASK:${:.2}", bid, ask)
+}
+
+fn format_remaining_time(secs: u64) -> String {
+    if secs >= 3600 {
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        let s = secs % 60;
+        format!("{}h {}m {}s", h, m, s)
+    } else if secs >= 60 {
+        let m = secs / 60;
+        let s = secs % 60;
+        format!("{}m {}s", m, s)
+    } else {
+        format!("{}s", secs)
+    }
+}
+
+async fn handle_key(
+    c: char,
+    trader: Arc<Trader>,
+    last_snapshot: Arc<tokio::sync::Mutex<Option<MarketSnapshot>>>,
+) {
+    let guard = last_snapshot.lock().await;
+    let snapshot = match guard.as_ref() {
+        Some(s) => s.clone(),
+        None => {
+            crate::log_println!("No snapshot yet; wait for price feed.");
+            return;
+        }
+    };
+    drop(guard);
+    match c {
+        '+' => {
+            if let Err(e) = trader.place_up_batch(&snapshot).await {
+                warn!("Place Up batch failed: {}", e);
+            }
+        }
+        '-' => {
+            if let Err(e) = trader.place_down_batch(&snapshot).await {
+                warn!("Place Down batch failed: {}", e);
+            }
+        }
+        '*' => {
+            if let Err(e) = trader.cancel_up_orders(&snapshot).await {
+                warn!("Cancel Up orders failed: {}", e);
+            }
+        }
+        '/' => {
+            if let Err(e) = trader.cancel_down_orders(&snapshot).await {
+                warn!("Cancel Down orders failed: {}", e);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -96,6 +184,10 @@ async fn main() -> Result<()> {
 
     env_logger::Builder::from_default_env()
         .filter_level(log::LevelFilter::Info)
+        .format(|buf, record| {
+            use std::io::Write;
+            write!(buf, "\r[{}] {}\r\n", record.level(), record.args())
+        })
         .target(env_logger::Target::Pipe(Box::new(dual_writer)))
         .init();
 
@@ -127,7 +219,7 @@ async fn main() -> Result<()> {
 
     if !is_simulation {
         match api.authenticate().await {
-            Ok(_) => eprintln!("Authentication successful"),
+            Ok(_) => crate::log_println!("Authentication successful"),
             Err(e) => {
                 warn!("Failed to authenticate: {}", e);
                 warn!("Order placement may fail. Verify credentials in config.json");
@@ -140,46 +232,82 @@ async fn main() -> Result<()> {
         anyhow::bail!("No markets configured. Add markets to config (e.g. [\"btc\", \"eth\"])");
     }
 
-    let cost_per_pair_max = config.trading.cost_per_pair_max;
+    let batch_count = config.trading.batch_count;
+    let shares_per_limit_order = config.trading.shares_per_limit_order;
     let min_side_price = config.trading.min_side_price;
     let max_side_price = config.trading.max_side_price;
-    let cooldown = config.trading.cooldown_seconds;
-    let cooldown_1h = config.trading.cooldown_seconds_1h;
-    let shares_override = config.trading.shares;
-    let size_reduce_after_secs = config.trading.size_reduce_after_secs;
-    let size_min_ratio = config.trading.size_min_ratio;
-    let size_min_shares = config.trading.size_min_shares;
     let data_source = config.trading.data_source.clone();
 
     let timeframes = &config.trading.timeframes;
     let timeframes_str: Vec<&str> = timeframes.iter().map(|s| s.as_str()).collect();
-    eprintln!("Strategy: balance-aware, buy one side when cost per pair <= max");
-    eprintln!("   Markets: {}", markets.join(", ").to_uppercase());
-    eprintln!("   Timeframes: {}", timeframes_str.join(", "));
-    eprintln!("   Cost per pair max: {}", cost_per_pair_max);
-    eprintln!("   Min side price: ${:.2} (no buy below)", min_side_price);
-    eprintln!("   Max side price: ${:.2} (no buy above)", max_side_price);
-    eprintln!("   Cooldown: {}s (1h: {}s)", cooldown, cooldown_1h);
-    eprintln!("   Shares: {:?} (default per market: BTC 15m=24, ETH 15m=14)", shares_override);
-    eprintln!("   Order type: FAK (partial fills possible)");
-    eprintln!("   Data source: {}", data_source.to_uppercase());
-    eprintln!();
+    crate::log_println!("Mode: Human-interactive (monitor price feed; single keypress = action)");
+    crate::log_println!("   Markets: {}", markets.join(", ").to_uppercase());
+    crate::log_println!("   Timeframes: {}", timeframes_str.join(", "));
+    crate::log_println!("   Batch: {} x {} shares per limit order (limit = ask+0.01)", batch_count, shares_per_limit_order);
+    crate::log_println!("   Price bounds: ${:.2}–${:.2}", min_side_price, max_side_price);
+    crate::log_println!("   Data source: {}", data_source.to_uppercase());
+    crate::log_println!("   Keys: + = place Up batch  |  - = place Down batch  |  * = cancel Up orders  |  / = cancel Down orders");
+    crate::log_println!("");
 
     let trader = Arc::new(Trader::new(
         api.clone(),
         is_simulation,
-        cost_per_pair_max,
+        batch_count,
+        shares_per_limit_order,
         min_side_price,
         max_side_price,
-        cooldown,
-        cooldown_1h,
-        shares_override,
-        size_reduce_after_secs,
-        size_min_ratio,
-        size_min_shares,
     ));
     let trader_closure = trader.clone();
     let market_closure_interval = config.trading.market_closure_check_interval_seconds;
+
+    let last_snapshot: Arc<tokio::sync::Mutex<Option<MarketSnapshot>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+
+    let trader_kb = trader.clone();
+    let last_snapshot_kb = last_snapshot.clone();
+    let (tx, rx) = mpsc::sync_channel::<char>(8);
+    std::thread::spawn(move || {
+        use std::time::Duration;
+        loop {
+            if crossterm::terminal::enable_raw_mode().is_err() {
+                break;
+            }
+            let has_event = event::poll(Duration::from_millis(80)).unwrap_or(false);
+            if has_event {
+                match event::read() {
+                    Ok(Event::Key(ke)) if ke.kind == KeyEventKind::Press => {
+                        if ke.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) && ke.code == KeyCode::Char('c') {
+                            let _ = crossterm::terminal::disable_raw_mode();
+                            std::process::exit(0);
+                        }
+                        let c = match ke.code {
+                            KeyCode::Char('+') => '+',
+                            KeyCode::Char('-') => '-',
+                            KeyCode::Char('*') => '*',
+                            KeyCode::Char('/') => '/',
+                            _ => continue,
+                        };
+                        if tx.send(c).is_err() {
+                            let _ = crossterm::terminal::disable_raw_mode();
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => {}
+                }
+            }
+            let _ = crossterm::terminal::disable_raw_mode();
+            std::thread::sleep(Duration::from_millis(85));
+        }
+    });
+    let handle = tokio::runtime::Handle::current();
+    tokio::spawn(async move {
+        let _ = tokio::task::spawn_blocking(move || {
+            while let Ok(c) = rx.recv() {
+                handle.block_on(handle_key(c, trader_kb.clone(), last_snapshot_kb.clone()));
+            }
+        }).await;
+    });
 
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(market_closure_interval));
@@ -205,7 +333,7 @@ async fn main() -> Result<()> {
             let duration_minutes = if tf == "1h" { 60 } else { 15 };
             let period_secs: u64 = if tf == "1h" { 3600 } else { 900 };
 
-            eprintln!("Discovering {} market...", market_name);
+            crate::log_println!("Discovering {} market...", market_name);
             let market = match discover_market_for_asset_timeframe(&api, asset, duration_minutes).await {
                 Ok(m) => m,
                 Err(e) => {
@@ -257,7 +385,7 @@ async fn main() -> Result<()> {
                             continue;
                         }
                     }
-                    eprintln!("New period detected for {}! (Period: {}) Discovering new market...", market_name_owned, current_period);
+                    crate::log_println!("New period detected for {}! (Period: {}) Discovering new market...", market_name_owned, current_period);
                     last_processed_period = Some(current_period);
                     let duration_min = if timeframe_owned.trim().eq_ignore_ascii_case("1h") { 60 } else { 15 };
                     match discover_market_for_asset_timeframe(&api_for_period_check, &asset_owned, duration_min).await {
@@ -279,14 +407,29 @@ async fn main() -> Result<()> {
 
             let monitor_start = monitor_arc.clone();
             let trader_start = trader.clone();
+            let last_snapshot_cb = last_snapshot.clone();
             tokio::spawn(async move {
                 monitor_start
                     .start_monitoring(move |snapshot| {
                         let trader = trader_start.clone();
+                        let last_snapshot = last_snapshot_cb.clone();
                         async move {
+                            last_snapshot.lock().await.replace(snapshot.clone());
                             if let Err(e) = trader.process_snapshot(&snapshot).await {
                                 warn!("Error processing snapshot: {}", e);
                             }
+                            let market_key = format!("{}:{}", snapshot.btc_market_15m.condition_id, snapshot.btc_15m_period_timestamp);
+                            let (up_bought, down_bought) = trader.get_matched_bought_prices(&market_key).await;
+                            let up_str = snapshot.btc_market_15m.up_token.as_ref().map(format_token_price).unwrap_or_else(|| "N/A".to_string());
+                            let down_str = snapshot.btc_market_15m.down_token.as_ref().map(format_token_price).unwrap_or_else(|| "N/A".to_string());
+                            let remaining = format_remaining_time(snapshot.btc_15m_time_remaining);
+                            let up_bought_str: String = if up_bought.is_empty() { "—".to_string() } else { up_bought.iter().map(|p| format!("${:.2}", p)).collect::<Vec<_>>().join(" ") };
+                            let down_bought_str: String = if down_bought.is_empty() { "—".to_string() } else { down_bought.iter().map(|p| format!("${:.2}", p)).collect::<Vec<_>>().join(" ") };
+                            let message = format!(
+                                "{} Up {} Down {} ⏳ {} | Up bought: {} | Down bought: {}\n",
+                                snapshot.market_name, up_str, down_str, remaining, up_bought_str, down_bought_str
+                            );
+                            crate::log_to_history(&message);
                         }
                     })
                     .await;
@@ -298,7 +441,7 @@ async fn main() -> Result<()> {
         anyhow::bail!("No valid markets found. Check your market configuration.");
     }
 
-    eprintln!("Started monitoring {} market(s)", handles.len());
+    crate::log_println!("Started monitoring {} market(s)", handles.len());
     futures::future::join_all(handles).await;
     Ok(())
 }
@@ -438,8 +581,7 @@ async fn discover_market(
 
     if let Ok(market) = api.get_market_by_slug(&slug).await {
         if !seen_ids.contains(&market.condition_id) && market.active && !market.closed {
-            eprintln!(
-                "Found {} {} market by slug: {} | Condition ID: {}",
+            crate::log_println!("Found {} {} market by slug: {} | Condition ID: {}",
                 market_name, timeframe_str, market.slug, market.condition_id
             );
             return Ok(market);

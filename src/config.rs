@@ -58,35 +58,32 @@ pub struct TradingConfig {
     pub data_source: String,
     #[serde(default = "default_markets")]
     pub markets: Vec<String>,
-    /// Timeframes to trade: ["15m", "1h"]. Both 15m and 1h markets run when both are set.
     #[serde(default = "default_timeframes")]
     pub timeframes: Vec<String>,
-    /// Max cost per pair when adding a side (target-like balancing). Add Up or Down only if (total_cost after add) / pairs <= this. e.g. 1.0 or 1.01.
-    #[serde(default = "default_cost_per_pair_max")]
-    pub cost_per_pair_max: f64,
-    /// Never buy a token if its ask price is below this (e.g. 0.05). Avoids nearly-resolved markets where the other side has effectively won.
+    /// Number of price datapoints required to confirm "rising" trend (e.g. 5 or 7).
+    #[serde(default = "default_trend_datapoints")]
+    pub trend_datapoints: usize,
+    /// When market is unclear, use this many datapoints for trend (e.g. 10 or 15).
+    #[serde(default = "default_trend_datapoints_extended")]
+    pub trend_datapoints_extended: usize,
+    /// Number of limit orders to place in one batch (e.g. 5).
+    #[serde(default = "default_batch_count")]
+    pub batch_count: usize,
+    /// Shares per limit order in the batch (e.g. 30 → 5 orders = 150 shares total).
+    #[serde(default = "default_shares_per_limit_order")]
+    pub shares_per_limit_order: f64,
+    /// Price offset for Down orders: place at (current_ask + this), e.g. -0.02 for 2 cents below ask.
+    #[serde(default = "default_limit_order_price_offset_down")]
+    pub limit_order_price_offset_down: f64,
+    /// After this many seconds, cancel unmatched limit orders (production only). 0 = never cancel.
+    #[serde(default = "default_cancel_unmatched_after_secs")]
+    pub cancel_unmatched_after_secs: u64,
+    /// Don't place orders if token ask is below this (safety).
     #[serde(default = "default_min_side_price")]
     pub min_side_price: f64,
-    /// Never buy a token if its ask price is above this (e.g. 0.99). Avoids overpaying for a near-certain outcome.
+    /// Don't place orders if token ask is above this (safety).
     #[serde(default = "default_max_side_price")]
     pub max_side_price: f64,
-    /// Min seconds between buys (any side) per market. 0 = condition-based only. Set e.g. 10 for 15m.
-    #[serde(default = "default_cooldown_seconds")]
-    pub cooldown_seconds: u64,
-    /// Min seconds between buys for 1h markets only (throttle 1h trading). Default 45.
-    #[serde(default = "default_cooldown_seconds_1h")]
-    pub cooldown_seconds_1h: u64,
-    /// Shares per side; if unset/0, use per-market defaults (BTC 15m=24, ETH 15m=14).
-    pub shares: Option<f64>,
-    /// Reduce order size in the last N seconds (volatility). Default 300 (5 min).
-    #[serde(default = "default_size_reduce_after_secs")]
-    pub size_reduce_after_secs: u64,
-    /// When reducing: size = base * (min_ratio + (1-min_ratio)*time_left/reduce_window). Default 0.5.
-    #[serde(default = "default_size_min_ratio")]
-    pub size_min_ratio: f64,
-    /// Minimum shares per order when reducing. Default 5.
-    #[serde(default = "default_size_min_shares")]
-    pub size_min_shares: f64,
 }
 
 fn default_market_closure_check_interval() -> u64 {
@@ -105,8 +102,28 @@ fn default_timeframes() -> Vec<String> {
     vec!["15m".to_string(), "1h".to_string()]
 }
 
-fn default_cost_per_pair_max() -> f64 {
-    1.01
+fn default_trend_datapoints() -> usize {
+    7
+}
+
+fn default_trend_datapoints_extended() -> usize {
+    15
+}
+
+fn default_batch_count() -> usize {
+    5
+}
+
+fn default_shares_per_limit_order() -> f64 {
+    30.0
+}
+
+fn default_limit_order_price_offset_down() -> f64 {
+    -0.02
+}
+
+fn default_cancel_unmatched_after_secs() -> u64 {
+    120
 }
 
 fn default_min_side_price() -> f64 {
@@ -115,26 +132,6 @@ fn default_min_side_price() -> f64 {
 
 fn default_max_side_price() -> f64 {
     0.99
-}
-
-fn default_cooldown_seconds() -> u64 {
-    0
-}
-
-fn default_cooldown_seconds_1h() -> u64 {
-    45
-}
-
-fn default_size_reduce_after_secs() -> u64 {
-    300
-}
-
-fn default_size_min_ratio() -> f64 {
-    0.5
-}
-
-fn default_size_min_shares() -> f64 {
-    5.0
 }
 
 impl Default for Config {
@@ -156,15 +153,14 @@ impl Default for Config {
                 data_source: "api".to_string(),
                 markets: vec!["btc".to_string()],
                 timeframes: default_timeframes(),
-                cost_per_pair_max: default_cost_per_pair_max(),
+                trend_datapoints: default_trend_datapoints(),
+                trend_datapoints_extended: default_trend_datapoints_extended(),
+                batch_count: default_batch_count(),
+                shares_per_limit_order: default_shares_per_limit_order(),
+                limit_order_price_offset_down: default_limit_order_price_offset_down(),
+                cancel_unmatched_after_secs: default_cancel_unmatched_after_secs(),
                 min_side_price: default_min_side_price(),
                 max_side_price: default_max_side_price(),
-                cooldown_seconds: default_cooldown_seconds(),
-                cooldown_seconds_1h: default_cooldown_seconds_1h(),
-                shares: None,
-                size_reduce_after_secs: default_size_reduce_after_secs(),
-                size_min_ratio: default_size_min_ratio(),
-                size_min_shares: default_size_min_shares(),
             },
         }
     }

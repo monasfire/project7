@@ -29,3 +29,4 @@ alloy-sol-types = "1.5"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.9"
 toml = "0.8"
+crossterm = "0.28"

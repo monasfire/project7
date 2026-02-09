@@ -114,6 +114,41 @@ pub struct RedeemResponse {
     pub amount_redeemed: Option<String>,
 }
 
+/// Response from Gamma GET /markets/slug/{slug}. outcomePrices is "[\"0.545\", \"0.455\"]" (Up, Down probabilities).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GammaMarketBySlug {
+    #[serde(rename = "conditionId")]
+    pub condition_id: String,
+    pub slug: String,
+    pub active: bool,
+    pub closed: bool,
+    #[serde(rename = "outcomePrices")]
+    pub outcome_prices: String, // e.g. "[\"0.545\", \"0.455\"]"
+}
+
+#[derive(Debug, Clone)]
+pub struct OutcomePrices {
+    /// Probability Up wins (first outcome)
+    pub up: f64,
+    /// Probability Down wins (second outcome)
+    pub down: f64,
+}
+
+impl GammaMarketBySlug {
+    /// Parse outcome_prices string "[\"0.595\", \"0.405\"]" (array of strings) into (up, down).
+    pub fn parse_outcome_prices(&self) -> Option<OutcomePrices> {
+        let s = self.outcome_prices.trim();
+        let arr: Vec<String> = serde_json::from_str(s).ok()?;
+        if arr.len() >= 2 {
+            let up = arr[0].parse::<f64>().ok()?;
+            let down = arr[1].parse::<f64>().ok()?;
+            Some(OutcomePrices { up, down })
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MarketData {
     pub condition_id: String,
